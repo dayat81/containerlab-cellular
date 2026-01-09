@@ -362,16 +362,66 @@ class FallbackTrafficCollector:
             27017: 'MongoDB',
         }
         
-        # Check for well-known IPs
+        # Check for well-known IPs and IP ranges
         known_hosts = {
             '8.8.8.8': 'Google DNS',
             '8.8.4.4': 'Google DNS',
             '1.1.1.1': 'Cloudflare DNS',
+            '1.0.0.1': 'Cloudflare DNS',
             '9.9.9.9': 'Quad9 DNS',
+            '208.67.222.222': 'OpenDNS',
+            '208.67.220.220': 'OpenDNS',
         }
         
         if ip in known_hosts:
             return known_hosts[ip]
+        
+        # Check IP ranges for known services
+        ip_parts = ip.split('.')
+        if len(ip_parts) == 4:
+            prefix = f"{ip_parts[0]}.{ip_parts[1]}"
+            
+            # Google IPs (142.250.x.x, 172.217.x.x, 216.58.x.x, 74.125.x.x)
+            if prefix in ['142.250', '172.217', '216.58', '74.125', '142.251']:
+                return 'Google'
+            
+            # Facebook/Meta IPs (157.240.x.x, 31.13.x.x)
+            if prefix in ['157.240', '31.13', '179.60', '185.60']:
+                return 'Facebook/Meta'
+            
+            # Amazon/AWS IPs (various ranges)
+            if prefix in ['52.94', '54.239', '99.84', '98.87', '205.251', '176.32']:
+                return 'Amazon/AWS'
+            
+            # Microsoft/GitHub IPs (20.x.x.x, 13.x.x.x for Azure, 140.82.x.x for GitHub)
+            if ip_parts[0] == '20' or ip_parts[0] == '13':
+                return 'Microsoft/Azure'
+            if prefix == '140.82':
+                return 'GitHub'
+            
+            # Cloudflare IPs (104.16.x.x, 172.67.x.x, 104.17.x.x, 172.66.x.x)
+            if prefix in ['104.16', '104.17', '172.67', '172.66', '104.18', '104.19']:
+                return 'Cloudflare CDN'
+            
+            # Netflix IPs (45.57.x.x, 23.246.x.x)
+            if prefix in ['45.57', '23.246', '198.38', '198.45']:
+                return 'Netflix'
+            
+            # Reddit IPs (151.101.x.x via Fastly)
+            if prefix == '151.101':
+                return 'Reddit/Fastly'
+            
+            # Twitter/X IPs (104.244.x.x)
+            if prefix == '104.244':
+                return 'Twitter/X'
+            
+            # Wikipedia IPs (103.102.x.x, 91.198.x.x)
+            if prefix in ['103.102', '91.198']:
+                return 'Wikipedia'
+            
+            # Akamai CDN
+            if prefix in ['23.72', '23.73', '104.64', '104.65']:
+                return 'Akamai CDN'
         
         if port in services:
             return f"{services[port]} ({ip})"
