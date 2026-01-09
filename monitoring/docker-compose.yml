@@ -1,0 +1,143 @@
+version: '3.8'
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: prometheus
+    restart: unless-stopped
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+      - '--web.external-url=http://34.34.219.137/prometheus'
+      - '--web.route-prefix=/prometheus'
+    ports:
+      - "9091:9090"
+    network_mode: host
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  grafana:
+    image: grafana/grafana:10.2.2
+    container_name: grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=http://34.34.219.137/grafana
+      - GF_SERVER_SERVE_FROM_SUB_PATH=true
+      - GF_SERVER_HTTP_PORT=3000
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3000:3000"
+    networks:
+      - monitoring
+    depends_on:
+      - prometheus
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.47.2
+    container_name: cadvisor
+    restart: unless-stopped
+    privileged: true
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    ports:
+      - "8080:8080"
+    networks:
+      - monitoring
+
+  node-exporter:
+    image: prom/node-exporter:v1.7.0
+    container_name: node-exporter
+    restart: unless-stopped
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.rootfs=/rootfs'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    network_mode: host
+
+  metrics-collector:
+    build:
+      context: ./collectors
+      dockerfile: Dockerfile
+    container_name: metrics-collector
+    restart: unless-stopped
+    environment:
+      - MONGODB_URI=mongodb://10.254.1.100:27017
+      - WEBUI_URL=http://10.254.1.200:9999
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      - "9200:9200"
+    networks:
+      - monitoring
+    depends_on:
+      - prometheus
+
+  # eBPF-based Per-UE Traffic Collector
+  ebpf-collector:
+    build:
+      context: ./collectors
+      dockerfile: Dockerfile.ebpf
+    container_name: ebpf-collector
+    restart: unless-stopped
+    # Required for eBPF operations
+    privileged: true
+    # Use host network to access container namespaces
+    network_mode: host
+    pid: host
+    environment:
+      - UPF_CONTAINER=clab-open5gs-5gc-upf
+      - OGSTUN_IFACE=ogstun
+      - GTPU_IFACE=eth1
+      - COLLECTOR_PORT=9201
+      - SCRAPE_INTERVAL=5
+      - MONGODB_HOST=10.254.1.100
+      - MONGODB_PORT=27017
+      - UE_SUBNET=172.45.1.0/24
+    volumes:
+      # Docker socket for container inspection
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Required for eBPF
+      - /sys/kernel/debug:/sys/kernel/debug:ro
+      - /sys/fs/bpf:/sys/fs/bpf:rw
+      - /lib/modules:/lib/modules:ro
+      - /usr/src:/usr/src:ro
+      # Access to container processes
+      - /proc:/host/proc:ro
+    cap_add:
+      - SYS_ADMIN
+      - NET_ADMIN
+      - SYS_PTRACE
+      - BPF
+      - PERFMON
+    security_opt:
+      - apparmor:unconfined
+    depends_on:
+      - prometheus
+
+volumes:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  monitoring:
+    driver: bridge

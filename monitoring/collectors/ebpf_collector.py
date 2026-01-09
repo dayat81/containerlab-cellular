@@ -26,6 +26,7 @@ import threading
 from datetime import datetime
 from typing import Dict, Optional, Tuple, List
 from dataclasses import dataclass, field
+from collections import defaultdict
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # Configure logging
@@ -61,6 +62,20 @@ UE_SUBNET_MASK = 0xFFFFFF00  # /24
 
 
 @dataclass
+class DestinationStats:
+    """Traffic statistics for a specific destination"""
+    dest_ip: str
+    dest_name: str = ""  # Resolved hostname or service name
+    bytes_sent: int = 0
+    bytes_recv: int = 0
+    packets_sent: int = 0
+    packets_recv: int = 0
+    connections: int = 0
+    protocol: str = "tcp"
+    port: int = 0
+
+
+@dataclass
 class UETrafficStats:
     """Traffic statistics for a single UE"""
     ue_ip: str
@@ -75,6 +90,7 @@ class UETrafficStats:
     gnb: str = ""
     dnn: str = "internet"
     pdu_session_id: int = 0
+    destinations: Dict[str, DestinationStats] = field(default_factory=dict)
     
     @property
     def total_bytes(self) -> int:
@@ -89,6 +105,15 @@ class UETrafficStats:
         if self.first_seen > 0:
             return time.time() - self.first_seen
         return 0.0
+    
+    @property
+    def top_destinations(self) -> List[DestinationStats]:
+        """Return top 10 destinations by total bytes"""
+        return sorted(
+            self.destinations.values(),
+            key=lambda d: d.bytes_sent + d.bytes_recv,
+            reverse=True
+        )[:10]
 
 
 @dataclass
@@ -252,7 +277,7 @@ class FallbackTrafficCollector:
             logger.debug(f"Failed to read /proc/net/dev: {e}")
     
     def _collect_per_ue_from_conntrack(self):
-        """Collect per-UE statistics using conntrack or iptables"""
+        """Collect per-UE statistics and destinations using conntrack"""
         # Get active connections from UPF
         try:
             result = subprocess.run(
@@ -265,23 +290,93 @@ class FallbackTrafficCollector:
             if result.returncode == 0:
                 import re
                 for line in result.stdout.strip().split('\n'):
-                    # Look for connections in UE subnet
-                    matches = re.findall(r'src=(\d+\.\d+\.\d+\.\d+)', line)
-                    for ip in matches:
-                        if self._is_ue_ip(ip):
-                            if ip not in self.ue_stats:
-                                self.ue_stats[ip] = UETrafficStats(
-                                    ue_ip=ip,
+                    # Parse conntrack entries
+                    # Format: ipv4 2 tcp 6 ... src=A dst=B sport=X dport=Y ... bytes=N
+                    src_matches = re.findall(r'src=(\d+\.\d+\.\d+\.\d+)', line)
+                    dst_matches = re.findall(r'dst=(\d+\.\d+\.\d+\.\d+)', line)
+                    sport_match = re.search(r'sport=(\d+)', line)
+                    dport_match = re.search(r'dport=(\d+)', line)
+                    bytes_matches = re.findall(r'bytes=(\d+)', line)
+                    packets_matches = re.findall(r'packets=(\d+)', line)
+                    
+                    # Determine protocol
+                    proto = 'tcp' if 'tcp' in line.lower() else 'udp' if 'udp' in line.lower() else 'other'
+                    
+                    # Process each source IP that's in UE subnet
+                    for i, src_ip in enumerate(src_matches):
+                        if self._is_ue_ip(src_ip):
+                            if src_ip not in self.ue_stats:
+                                self.ue_stats[src_ip] = UETrafficStats(
+                                    ue_ip=src_ip,
                                     first_seen=time.time()
                                 )
-                            self.ue_stats[ip].last_seen = time.time()
+                            self.ue_stats[src_ip].last_seen = time.time()
                             
-                            # Extract bytes if available
-                            bytes_match = re.search(r'bytes=(\d+)', line)
-                            if bytes_match:
-                                self.ue_stats[ip].bytes_out = int(bytes_match.group(1))
+                            # Get destination for this UE
+                            if i < len(dst_matches):
+                                dst_ip = dst_matches[i]
+                                if not self._is_ue_ip(dst_ip):  # External destination
+                                    dport = int(dport_match.group(1)) if dport_match else 0
+                                    dest_key = f"{dst_ip}:{dport}"
+                                    
+                                    if dest_key not in self.ue_stats[src_ip].destinations:
+                                        self.ue_stats[src_ip].destinations[dest_key] = DestinationStats(
+                                            dest_ip=dst_ip,
+                                            dest_name=self._resolve_dest_name(dst_ip, dport),
+                                            port=dport,
+                                            protocol=proto
+                                        )
+                                    
+                                    dest = self.ue_stats[src_ip].destinations[dest_key]
+                                    dest.connections += 1
+                                    
+                                    # Get bytes/packets if available (usually two values: original + reply)
+                                    if len(bytes_matches) >= 1:
+                                        dest.bytes_sent = int(bytes_matches[0])
+                                    if len(bytes_matches) >= 2:
+                                        dest.bytes_recv = int(bytes_matches[1])
+                                    if len(packets_matches) >= 1:
+                                        dest.packets_sent = int(packets_matches[0])
+                                    if len(packets_matches) >= 2:
+                                        dest.packets_recv = int(packets_matches[1])
+                                        
         except Exception as e:
             logger.debug(f"Failed to read conntrack: {e}")
+    
+    def _resolve_dest_name(self, ip: str, port: int) -> str:
+        """Resolve destination IP/port to a human-readable name"""
+        # Common well-known services
+        services = {
+            80: 'HTTP',
+            443: 'HTTPS',
+            53: 'DNS',
+            8080: 'HTTP-Alt',
+            22: 'SSH',
+            21: 'FTP',
+            25: 'SMTP',
+            110: 'POP3',
+            143: 'IMAP',
+            3306: 'MySQL',
+            5432: 'PostgreSQL',
+            6379: 'Redis',
+            27017: 'MongoDB',
+        }
+        
+        # Check for well-known IPs
+        known_hosts = {
+            '8.8.8.8': 'Google DNS',
+            '8.8.4.4': 'Google DNS',
+            '1.1.1.1': 'Cloudflare DNS',
+            '9.9.9.9': 'Quad9 DNS',
+        }
+        
+        if ip in known_hosts:
+            return known_hosts[ip]
+        
+        if port in services:
+            return f"{services[port]} ({ip})"
+        
+        return ip
         
         # Also check each UE container for traffic stats
         self._collect_from_ue_interfaces()
@@ -315,32 +410,40 @@ class FallbackTrafficCollector:
                     if ip_match:
                         ue_ip = ip_match.group(1)
                         
-                        # Extract traffic stats for uesimtun0
+                        # Extract traffic stats for uesimtun0 from /proc/net/dev
+                        # Format: "uesimtun0:   12852     153    0    0   ..."
                         for line in result.stdout.split('\n'):
-                            if 'uesimtun0' in line:
+                            # Match lines that start with uesimtun0: (the /proc/net/dev format)
+                            if line.strip().startswith('uesimtun0:'):
                                 parts = line.split()
-                                if len(parts) >= 10:
-                                    rx_bytes = int(parts[1])
-                                    rx_packets = int(parts[2])
-                                    tx_bytes = int(parts[9])
-                                    tx_packets = int(parts[10])
-                                    
-                                    if ue_ip not in self.ue_stats:
-                                        self.ue_stats[ue_ip] = UETrafficStats(
-                                            ue_ip=ue_ip,
-                                            first_seen=time.time()
-                                        )
-                                    
-                                    stats = self.ue_stats[ue_ip]
-                                    # RX on UE = downlink (bytes_in)
-                                    # TX on UE = uplink (bytes_out)
-                                    stats.bytes_in = rx_bytes
-                                    stats.packets_in = rx_packets
-                                    stats.bytes_out = tx_bytes
-                                    stats.packets_out = tx_packets
-                                    stats.last_seen = time.time()
-                                    if stats.first_seen == 0:
-                                        stats.first_seen = time.time()
+                                if len(parts) >= 11:
+                                    # parts[0] = "uesimtun0:"
+                                    # parts[1] = rx_bytes, parts[2] = rx_packets
+                                    # parts[9] = tx_bytes, parts[10] = tx_packets
+                                    try:
+                                        rx_bytes = int(parts[1])
+                                        rx_packets = int(parts[2])
+                                        tx_bytes = int(parts[9])
+                                        tx_packets = int(parts[10])
+                                        
+                                        if ue_ip not in self.ue_stats:
+                                            self.ue_stats[ue_ip] = UETrafficStats(
+                                                ue_ip=ue_ip,
+                                                first_seen=time.time()
+                                            )
+                                        
+                                        stats = self.ue_stats[ue_ip]
+                                        # RX on UE = downlink (bytes_in)
+                                        # TX on UE = uplink (bytes_out)
+                                        stats.bytes_in = rx_bytes
+                                        stats.packets_in = rx_packets
+                                        stats.bytes_out = tx_bytes
+                                        stats.packets_out = tx_packets
+                                        stats.last_seen = time.time()
+                                        if stats.first_seen == 0:
+                                            stats.first_seen = time.time()
+                                    except (ValueError, IndexError) as e:
+                                        logger.debug(f"Failed to parse stats: {e}")
             except Exception as e:
                 logger.debug(f"Failed to get stats from {container}: {e}")
     
@@ -718,6 +821,55 @@ class PrometheusMetricsHandler(BaseHTTPRequestHandler):
                 f'pdu_session_id="{stats.pdu_session_id}"'
             )
             lines.append(f'ue_session_info{{{labels}}} 1')
+        
+        # Top destinations per UE
+        lines.append('')
+        lines.append('# HELP ue_destination_bytes_total Bytes transferred per UE destination')
+        lines.append('# TYPE ue_destination_bytes_total counter')
+        
+        for ip, stats in ue_stats.items():
+            for dest in stats.top_destinations:
+                labels = (
+                    f'ue_ip="{stats.ue_ip}",'
+                    f'imsi="{stats.imsi}",'
+                    f'dest_ip="{dest.dest_ip}",'
+                    f'dest_name="{dest.dest_name}",'
+                    f'port="{dest.port}",'
+                    f'protocol="{dest.protocol}"'
+                )
+                total_bytes = dest.bytes_sent + dest.bytes_recv
+                lines.append(f'ue_destination_bytes_total{{{labels}}} {total_bytes}')
+        
+        lines.append('')
+        lines.append('# HELP ue_destination_packets_total Packets transferred per UE destination')
+        lines.append('# TYPE ue_destination_packets_total counter')
+        
+        for ip, stats in ue_stats.items():
+            for dest in stats.top_destinations:
+                labels = (
+                    f'ue_ip="{stats.ue_ip}",'
+                    f'imsi="{stats.imsi}",'
+                    f'dest_ip="{dest.dest_ip}",'
+                    f'dest_name="{dest.dest_name}",'
+                    f'port="{dest.port}"'
+                )
+                total_packets = dest.packets_sent + dest.packets_recv
+                lines.append(f'ue_destination_packets_total{{{labels}}} {total_packets}')
+        
+        lines.append('')
+        lines.append('# HELP ue_destination_connections Active connections per UE destination')
+        lines.append('# TYPE ue_destination_connections gauge')
+        
+        for ip, stats in ue_stats.items():
+            for dest in stats.top_destinations:
+                labels = (
+                    f'ue_ip="{stats.ue_ip}",'
+                    f'imsi="{stats.imsi}",'
+                    f'dest_ip="{dest.dest_ip}",'
+                    f'dest_name="{dest.dest_name}",'
+                    f'port="{dest.port}"'
+                )
+                lines.append(f'ue_destination_connections{{{labels}}} {dest.connections}')
         
         # Store for rate calculation
         self.prev_stats = {ip: UETrafficStats(
