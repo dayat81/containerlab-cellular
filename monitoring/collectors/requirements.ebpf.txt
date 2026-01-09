@@ -1,0 +1,23 @@
+# Python dependencies for eBPF Traffic Collector
+
+# Note: python3-bpfcc is installed via apt, but we include bcc here
+# in case the system package is not available
+# bcc
+
+# HTTP server is built-in, but we might want async support
+aiohttp>=3.8.0
+
+# For Docker API access
+docker>=6.0.0
+
+# MongoDB client for session correlation
+pymongo>=4.0.0
+
+# Prometheus client (optional, for additional metrics)
+prometheus-client>=0.17.0
+
+# For JSON handling
+orjson>=3.9.0
+
+# Requests for API calls
+requests>=2.31.0

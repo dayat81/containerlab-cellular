@@ -1,0 +1,65 @@
+# eBPF Traffic Collector for 5G UPF Monitoring
+#
+# This container runs the eBPF-based per-UE traffic collector
+# Requires privileged mode and host network namespace access
+
+FROM ubuntu:22.04
+
+LABEL maintainer="5G Network Monitoring"
+LABEL description="eBPF-based per-UE traffic collector for Open5GS UPF"
+
+# Avoid interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install dependencies
+RUN apt-get update && apt-get install -y \
+    python3 \
+    python3-pip \
+    python3-dev \
+    # BCC dependencies
+    bpfcc-tools \
+    python3-bpfcc \
+    libbpfcc \
+    libbpfcc-dev \
+    # Kernel headers (for eBPF compilation)
+    linux-headers-generic \
+    # Network tools
+    iproute2 \
+    iputils-ping \
+    net-tools \
+    tcpdump \
+    # Docker CLI for container inspection
+    docker.io \
+    # Build tools
+    gcc \
+    make \
+    clang \
+    llvm \
+    # Utilities
+    curl \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+COPY requirements.ebpf.txt /tmp/requirements.txt
+RUN pip3 install --no-cache-dir -r /tmp/requirements.txt
+
+# Create app directory
+WORKDIR /app
+
+# Copy eBPF program and collector
+COPY ebpf/traffic_monitor.c /app/ebpf/
+COPY ebpf_collector.py /app/
+
+# Make collector executable
+RUN chmod +x /app/ebpf_collector.py
+
+# Expose Prometheus metrics port
+EXPOSE 9201
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:9201/health || exit 1
+
+# Run the collector
+CMD ["python3", "/app/ebpf_collector.py"]
