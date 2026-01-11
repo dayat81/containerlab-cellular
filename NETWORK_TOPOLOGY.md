@@ -273,6 +273,190 @@ sudo docker exec clab-open5gs-5gc-mongodb mongosh --quiet --eval \
   'db.getSiblingDB("open5gs").subscribers.find({}, {imsi: 1})'
 ```
 
+## Monitoring Stack
+
+### Architecture
+
+```mermaid
+flowchart TB
+    subgraph Monitoring[Monitoring Stack]
+        Prometheus[Prometheus<br/>:9091]
+        Grafana[Grafana<br/>:3000]
+        cAdvisor[cAdvisor<br/>:8080]
+        NodeExp[Node Exporter<br/>:9100]
+        MetricsCol[Metrics Collector<br/>:9200]
+        eBPFCol[eBPF Collector<br/>:9201]
+    end
+
+    subgraph Core[5G Core]
+        AMF[AMF]
+        SMF[SMF]
+        UPF[UPF]
+        NRF[NRF]
+        Other[Other NFs...]
+    end
+
+    subgraph RAN[UERANSIM]
+        GNBs[gNodeBs]
+        UEs[UEs]
+    end
+
+    subgraph Host[Host System]
+        Docker[Docker Engine]
+        System[System Metrics]
+    end
+
+    Grafana --> Prometheus
+    Prometheus --> cAdvisor
+    Prometheus --> NodeExp
+    Prometheus --> MetricsCol
+    Prometheus --> eBPFCol
+    Prometheus --> AMF
+    Prometheus --> SMF
+    Prometheus --> UPF
+    Prometheus --> NRF
+    Prometheus --> Other
+
+    cAdvisor --> Docker
+    NodeExp --> System
+    MetricsCol --> GNBs
+    MetricsCol --> UEs
+    eBPFCol --> UPF
+    eBPFCol --> UEs
+```
+
+### Monitoring Components
+
+| Component | Container | Port | Description |
+|-----------|-----------|------|-------------|
+| Prometheus | prometheus | 9091 | Time-series metrics database |
+| Grafana | grafana | 3000 | Visualization dashboards |
+| cAdvisor | cadvisor | 8080 | Container resource metrics |
+| Node Exporter | node-exporter | 9100 | Host system metrics |
+| Metrics Collector | metrics-collector | 9200 | 5G session & container metrics |
+| eBPF Collector | ebpf-collector | 9201 | Per-UE traffic statistics |
+
+### Data Flow
+
+```mermaid
+flowchart LR
+    subgraph DataSources[Data Sources]
+        UPF[UPF ogstun]
+        UEtun[UE uesimtun0]
+        Conntrack[conntrack]
+        MongoDB[(MongoDB)]
+    end
+
+    subgraph Collectors[Collectors]
+        eBPF[eBPF Collector]
+        Metrics[Metrics Collector]
+    end
+
+    subgraph Storage[Storage & Display]
+        Prom[Prometheus]
+        Graf[Grafana]
+    end
+
+    UPF -->|/proc/net/dev| eBPF
+    UEtun -->|/proc/net/dev| eBPF
+    Conntrack -->|destinations| eBPF
+    MongoDB -->|session info| eBPF
+    MongoDB -->|subscribers| Metrics
+
+    eBPF -->|ue_* metrics| Prom
+    Metrics -->|gnb_*, ue_* metrics| Prom
+    Prom --> Graf
+```
+
+### Grafana Dashboards
+
+| Dashboard | File | Description |
+|-----------|------|-------------|
+| 5G Network Overview | `5g-network-overview.json` | System-wide view: CPU, memory, container stats, total traffic |
+| UE Traffic Analytics | `ue-traffic-analytics.json` | Per-UE metrics: traffic, sessions, destinations, gNB breakdown |
+
+### Key Metrics
+
+#### Per-UE Metrics (eBPF Collector)
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `ue_bytes_in` | counter | ue_ip, imsi, gnb | Downlink bytes |
+| `ue_bytes_out` | counter | ue_ip, imsi, gnb | Uplink bytes |
+| `ue_packets_in` | counter | ue_ip, imsi, gnb | Downlink packets |
+| `ue_packets_out` | counter | ue_ip, imsi, gnb | Uplink packets |
+| `ue_session_duration_seconds` | gauge | ue_ip, imsi | Session duration |
+| `ue_destination_connections` | gauge | ue_ip, dest_ip, dest_name, port, protocol | Connections per destination |
+
+#### Container Metrics (cAdvisor)
+
+| Metric | Description |
+|--------|-------------|
+| `container_cpu_usage_seconds_total` | CPU usage per container |
+| `container_memory_usage_bytes` | Memory usage per container |
+| `container_network_receive_bytes_total` | Network RX bytes |
+| `container_network_transmit_bytes_total` | Network TX bytes |
+
+#### Host Metrics (Node Exporter)
+
+| Metric | Description |
+|--------|-------------|
+| `node_cpu_seconds_total` | Host CPU usage |
+| `node_memory_MemTotal_bytes` | Total host memory |
+| `node_network_receive_bytes_total` | Host network RX |
+| `node_network_transmit_bytes_total` | Host network TX |
+
+### Prometheus Scrape Targets
+
+| Job Name | Target | Interval |
+|----------|--------|----------|
+| prometheus | localhost:9090 | 15s |
+| node-exporter | localhost:9100 | 15s |
+| cadvisor | localhost:8080 | 15s |
+| metrics-collector | localhost:9200 | 15s |
+| ebpf-collector | localhost:9201 | 5s |
+| open5gs-amf | 10.254.1.1:9090 | 15s |
+| open5gs-smf | 10.254.1.8:9090 | 15s |
+| open5gs-upf | 10.100.1.3:9090 | 15s |
+| open5gs-pcf | 10.254.1.6:9091 | 15s |
+| open5gs-nrf | 10.254.1.4:9090 | 15s |
+| open5gs-ausf | 10.254.1.2:9090 | 15s |
+| open5gs-udm | 10.254.1.9:9090 | 15s |
+| open5gs-udr | 10.254.1.10:9090 | 15s |
+| open5gs-bsf | 10.254.1.3:9090 | 15s |
+| open5gs-nssf | 10.254.1.5:9090 | 15s |
+| open5gs-scp | 10.254.1.7:9090 | 15s |
+
+### Monitoring Access
+
+| Service | URL | Credentials |
+|---------|-----|-------------|
+| Grafana | http://34.34.219.137/grafana | admin / admin |
+| Prometheus | http://34.34.219.137/prometheus | - |
+
+### Monitoring Commands
+
+```bash
+# Start monitoring stack
+cd monitoring && sudo docker-compose up -d
+
+# Stop monitoring stack
+cd monitoring && sudo docker-compose down
+
+# View collector logs
+sudo docker logs -f ebpf-collector
+sudo docker logs -f metrics-collector
+
+# Check Prometheus targets
+curl -s http://localhost:9091/prometheus/api/v1/targets | jq '.data.activeTargets[] | {job: .labels.job, health: .health}'
+
+# Query UE traffic metrics
+curl -s http://localhost:9201/metrics | grep "ue_bytes"
+
+# Query destination metrics
+curl -s http://localhost:9201/metrics | grep "ue_destination"
+```
+
 ## File Locations
 
 | File | Path |
@@ -282,3 +466,8 @@ sudo docker exec clab-open5gs-5gc-mongodb mongosh --quiet --eval \
 | gNB Configs | `containerlab/5g-sa_open5gs_ueransim/conf/ueransim/gnb*.yaml` |
 | UE Configs | `containerlab/5g-sa_open5gs_ueransim/conf/ueransim/ue*.yaml` |
 | Open5GS Configs | `containerlab/5g-sa_open5gs_ueransim/conf/open5gs/*.yaml` |
+| Monitoring Compose | `monitoring/docker-compose.yml` |
+| Prometheus Config | `monitoring/prometheus/prometheus.yml` |
+| Grafana Dashboards | `monitoring/grafana/provisioning/dashboards/*.json` |
+| eBPF Collector | `monitoring/collectors/ebpf_collector.py` |
+| Metrics Collector | `monitoring/collectors/metrics_collector.py` |

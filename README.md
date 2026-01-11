@@ -1,3 +1,16 @@
+# 1. Start services
+sudo systemctl start docker openvswitch-switch libvirtd
+
+# 2. Continue building remaining images
+cd /home/hiida/containerlab-cellular
+sudo docker build --no-cache -t giros-dit/open5gs:latest docker/open5gs/
+sudo docker build --no-cache -t giros-dit/mongodb:latest docker/mongodb/
+
+# 3. Deploy and run the 5G network
+cd containerlab/5g-sa_open5gs_ueransim/scripts
+./deploy.sh
+./start-gnb.sh  # in separate terminal
+./start-ue1.sh  # in separate terminal
 # _Containerlab_ scenarios for cellular mobile communications networks
 
 ## Acknowledgements

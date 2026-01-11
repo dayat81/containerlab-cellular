@@ -21,7 +21,7 @@ start_lab() {
     
     # Step 1: Deploy containerlab topology
     echo ""
-    echo "[1/7] Deploying containerlab topology..."
+    echo "[1/9] Deploying containerlab topology..."
     cd containerlab/5g-sa_open5gs_ueransim
     sudo containerlab deploy -t topologies/open5gs-5gc.yaml --reconfigure 2>/dev/null || \
     sudo containerlab deploy -t topologies/open5gs-5gc.yaml
@@ -30,52 +30,152 @@ start_lab() {
     cd "$SCRIPT_DIR"
     
     echo ""
-    echo "[2/7] Waiting for 5G Core to initialize (30 seconds)..."
-    sleep 30
-    
-    # Step 2: Setup network IPs for monitoring
-    echo ""
-    echo "[3/7] Setting up network IPs for Prometheus access..."
+    echo "[2/9] Setting up network IPs for Prometheus access..."
     sudo ip addr add 10.254.1.254/24 dev br-sbi 2>/dev/null || true
     sudo ip addr add 10.100.1.254/24 dev br-n2-n3-n4 2>/dev/null || true
     sudo ip link set dev br-sbi up 2>/dev/null || true
     sudo ip link set dev br-n2-n3-n4 up 2>/dev/null || true
     
-    # Step 3: Start monitoring stack
+    # Step 2: Start MongoDB and add subscribers
     echo ""
-    echo "[4/7] Starting monitoring stack (Prometheus + Grafana)..."
+    echo "[3/9] Starting MongoDB and adding subscribers..."
+    sudo docker exec clab-open5gs-5gc-mongodb mkdir -p /data/db
+    sudo docker exec clab-open5gs-5gc-mongodb pkill -9 mongod 2>/dev/null || true
+    sleep 1
+    sudo docker exec -d clab-open5gs-5gc-mongodb mongod --bind_ip_all
+    sleep 3
+    
+    # Add subscribers to MongoDB
+    cd containerlab/5g-sa_open5gs_ueransim
+    for i in 1 2 3 4 5 6; do
+        IMSI="00101000000000$i"
+        sudo docker exec clab-open5gs-5gc-mongodb mongosh --quiet open5gs --eval "
+            db.subscribers.replaceOne(
+                {imsi: '$IMSI'},
+                {
+                    imsi: '$IMSI',
+                    security: {
+                        k: '465B5CE8B199B49FAA5F0A2EE238A6BC',
+                        amf: '8000',
+                        op: null,
+                        opc: 'E8ED289DEBA952E4283B54E88E6183CA'
+                    },
+                    ambr: {
+                        uplink: { value: 1, unit: 3 },
+                        downlink: { value: 1, unit: 3 }
+                    },
+                    slice: [{
+                        sst: 1,
+                        default_indicator: true,
+                        session: [{
+                            name: 'internet',
+                            type: 3,
+                            pcc_rule: [],
+                            ambr: {
+                                uplink: { value: 1, unit: 3 },
+                                downlink: { value: 1, unit: 3 }
+                            },
+                            qos: {
+                                index: 9,
+                                arp: {
+                                    priority_level: 8,
+                                    pre_emption_capability: 1,
+                                    pre_emption_vulnerability: 1
+                                }
+                            }
+                        }]
+                    }],
+                    access_restriction_data: 32,
+                    subscriber_status: 0,
+                    network_access_mode: 0,
+                    subscribed_rau_tau_timer: 12,
+                    __v: 0
+                },
+                {upsert: true}
+            )
+        " 2>/dev/null || true
+    done
+    cd "$SCRIPT_DIR"
+    
+    # Step 3: Copy Open5GS config files and start services
+    echo ""
+    echo "[4/9] Copying Open5GS configs and starting services..."
+    cd containerlab/5g-sa_open5gs_ueransim
+    for nf in nrf scp ausf udm udr pcf nssf bsf amf smf upf; do
+        sudo docker cp conf/open5gs/${nf}.yaml clab-open5gs-5gc-$nf:/open5gs/install/etc/open5gs/${nf}.yaml 2>/dev/null || true
+        sudo docker exec clab-open5gs-5gc-$nf pkill -9 open5gs 2>/dev/null || true
+    done
+    cd "$SCRIPT_DIR"
+    sleep 2
+    
+    # Start Open5GS services in proper order
+    for nf in nrf scp; do
+        sudo docker exec -d clab-open5gs-5gc-$nf /open5gs/install/bin/open5gs-${nf}d
+        sleep 1
+    done
+    sleep 3
+    
+    for nf in ausf udm udr pcf nssf bsf; do
+        sudo docker exec -d clab-open5gs-5gc-$nf /open5gs/install/bin/open5gs-${nf}d
+        sleep 0.3
+    done
+    sleep 2
+    
+    for nf in amf smf upf; do
+        sudo docker exec -d clab-open5gs-5gc-$nf /open5gs/install/bin/open5gs-${nf}d
+        sleep 1
+    done
+    sleep 3
+    
+    # Step 4: Start monitoring stack
+    echo ""
+    echo "[5/9] Starting monitoring stack (Prometheus + Grafana)..."
     cd monitoring
     sudo docker-compose up -d
     cd "$SCRIPT_DIR"
     
     echo ""
-    echo "[5/7] Waiting for services to stabilize (20 seconds)..."
-    sleep 20
+    echo "[6/9] Waiting for services to stabilize (10 seconds)..."
+    sleep 10
     
-    # Step 4: Restart gNBs to establish NGAP connections
+    # Step 5: Copy gNB and UE config files
     echo ""
-    echo "[6/7] Restarting gNBs and UEs for fresh connections..."
+    echo "[7/9] Copying gNB and UE configuration files..."
+    cd containerlab/5g-sa_open5gs_ueransim
+    sudo docker cp conf/ueransim/gnb.yaml clab-ueransim-gnb:/UERANSIM/build/gnb.yaml 2>/dev/null || true
+    sudo docker cp conf/ueransim/gnb2.yaml clab-ueransim-gnb2:/UERANSIM/build/gnb.yaml 2>/dev/null || true
+    sudo docker cp conf/ueransim/gnb3.yaml clab-ueransim-gnb3:/UERANSIM/build/gnb.yaml 2>/dev/null || true
+    
+    for i in 1 2 3 4 5 6; do
+        sudo docker cp conf/ueransim/ue${i}.yaml clab-ueransim-ue$i:/UERANSIM/build/ue.yaml 2>/dev/null || true
+    done
+    cd "$SCRIPT_DIR"
+    
+    # Step 6: Start gNBs
+    echo ""
+    echo "[8/9] Starting gNBs and UEs..."
     for gnb in gnb gnb2 gnb3; do
         sudo docker exec clab-ueransim-${gnb} pkill -9 nr-gnb 2>/dev/null || true
-        sleep 1
-        sudo docker exec -d clab-ueransim-${gnb} bash -c "cd /UERANSIM && ./build/nr-gnb -c /gnb.yaml > /var/log/gnb.log 2>&1"
+        sleep 0.3
+        sudo docker exec -d clab-ueransim-${gnb} bash -c "cd /UERANSIM/build && ./nr-gnb -c gnb.yaml > /var/log/gnb.log 2>&1"
     done
     sleep 5
     
+    # Step 7: Start UEs
     for ue in ue1 ue2 ue3 ue4 ue5 ue6; do
         sudo docker exec clab-ueransim-${ue} pkill -9 nr-ue 2>/dev/null || true
         sudo docker exec clab-ueransim-${ue} pkill -9 ping 2>/dev/null || true
         sudo docker exec clab-ueransim-${ue} pkill -9 iperf 2>/dev/null || true
-        sleep 1
-        sudo docker exec -d clab-ueransim-${ue} bash -c "cd /UERANSIM && ./build/nr-ue -c /ue.yaml > /var/log/ue.log 2>&1"
+        sleep 0.3
+        sudo docker exec -d clab-ueransim-${ue} bash -c "cd /UERANSIM/build && ./nr-ue -c ue.yaml > /var/log/ue.log 2>&1"
     done
     sleep 10
     
-    # Step 5: Start background pings
+    # Step 8: Start background pings
     echo ""
-    echo "[7/7] Starting background traffic (pings from all UEs)..."
+    echo "[9/9] Starting background traffic (pings from all UEs)..."
     for ue in ue1 ue2 ue3 ue4 ue5 ue6; do
-        sudo docker exec -d clab-ueransim-${ue} ping -I uesimtun0 8.8.8.8
+        sudo docker exec -d clab-ueransim-${ue} ping -I uesimtun0 8.8.8.8 > /dev/null 2>&1 || true
     done
     
     echo ""
